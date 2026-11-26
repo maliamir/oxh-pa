@@ -12,6 +12,9 @@ A production-shaped, intentionally compact implementation of the Oxbridge Health
    ```
 2. **Build and start PostgreSQL 16 and the API container:**
    ```bash
+   docker compose build --no-cache
+   docker compose up -d
+   OR
    docker compose up --build -d
    ```
    On startup, the `postgres` container initializes `oxh_prior_auth` and `oxh_prior_auth_test` via `sql/create_databases.sql`, and the `api` container executes `alembic upgrade head`, runs idempotent seeding (`python -m app.seed`) when `SEED_ON_STARTUP=true` (enabled in `compose.yaml`, disabled by default in `Dockerfile` for AWS deployments), and starts Uvicorn as non-root user `oxh`.
@@ -60,8 +63,110 @@ Import `postman/Oxbridge-PA.postman_collection.json` directly into **Postman** o
 
 ## 5. Architecture & Data Model Overview
 
-- **Logical Flow:** Four actors (`Office`, `Member`, `Reviewer`, `Admin`) authenticate via HS256 JWTs (`iss=oxh-identity`, `aud=oxh-pa`), enter role-specific FastAPI routers (`/v1/office`, `/v1/member`, `/v1/reviewer`, `/v1/admin`), and execute transactional workflows in `app/service.py` against PostgreSQL 16 (`submitted → in_review → decided`).
-- **Entity Relationships:** Eleven PostgreSQL tables (`practices`, `members`, `users`, `practice_members`, `coverages`, `reviewer_patients`, `prior_authorizations`, `authorization_procedures`, `procedure_decisions`, `audit_events`, `submission_attempts`) enforcing referential integrity, `1..30` unit bounds, `decided` state approver check constraints, denial reason rules, practice-scoped idempotency keys, and database triggers preventing `UPDATE`/`DELETE` on `procedure_decisions` and `audit_events`.
+The following views are derived from [`TECHNICAL_ARCHITECTURE.md`](./TECHNICAL_ARCHITECTURE.md). They describe this architecture brief's runtime, persistence, workflows, projections, and diagnostics without introducing unimplemented services. The editable seven-page source is [`diagrams/source/oxh-pa-technical-architecture.drawio`](diagrams/source/oxh-pa-technical-architecture.drawio).
+
+### 5.1 System Context and Local Deployment
+
+![System context and local deployment](diagrams/export/oxh-pa-technical-01-system-context.svg)
+
+Four authenticated actors use one HTTPS-capable FastAPI boundary. The local runtime contains one stateless, non-root API container and one PostgreSQL 16 container. PostgreSQL is authoritative for identity-role bindings, workflow state, PHI, decisions, audit events, and submission diagnostics.
+
+The trust boundaries intentionally show that an external identity provider/JWKS client, message broker, cache, object store, frontend, production ingress, and TLS termination are **not** implemented runtime components. Postman/Bruno and `app.tokens` are local evaluation tools, not production identity services.
+
+### 5.2 Application Components
+
+![Application component view](diagrams/export/oxh-pa-technical-02-application-components.svg)
+
+The synchronous request path is:
+
+```text
+HTTP request
+  → FastAPI assembly
+  → request/correlation middleware
+  → JWT authentication and role dependency
+  → role-specific router and schema
+  → transactional service layer
+  → SQLAlchemy model/session layer
+  → PostgreSQL
+```
+
+Shared error handlers translate domain and schema failures into RFC 9457 Problem Details. Role routers define HTTP contracts and projections, while `app.service` owns record-level authorization, business rules, locking, transactions, audit events, and diagnostic writes.
+
+### 5.3 Relational Data Model
+
+![Relational data model](diagrams/export/oxh-pa-technical-03-relational-data-model.svg)
+
+The model distinguishes PHI-bearing authorization data from minimal operational diagnostics. Core relationships connect practices, members, users, eligibility coverage, treating-reviewer conflicts, authorization procedure lines, immutable decisions, and audit events.
+
+Important persistence guarantees include:
+
+- unique practice-scoped idempotency keys;
+- service units constrained to `1..30`;
+- `decided` parents requiring deciding user and timestamp;
+- one final decision at most per procedure;
+- denial-reason consistency with approved/denied outcomes;
+- indexes supporting tenant history, queue assignment, coverage, audit, and support searches;
+- PostgreSQL triggers rejecting `UPDATE` or `DELETE` on `procedure_decisions` and `audit_events`.
+
+`submission_attempts` contains IDs, flags, timestamps, and error codes only. It intentionally excludes raw request content and clinical notes.
+
+### 5.4 Office Submission Sequence
+
+![Office submission sequence](diagrams/export/oxh-pa-technical-04-submission-sequence.svg)
+
+The submission path separates the primary authorization transaction from support diagnostics:
+
+1. Middleware generates the server request ID and derives an optional client correlation ID.
+2. Schema and auth validate procedure codes, units, duplicate procedures, JWT claims, role, and practice binding.
+3. The service hashes canonical request JSON and acquires a practice-and-key PostgreSQL advisory lock.
+4. Identical idempotent replays return the existing case; changed payloads return `409`; new keys proceed to eligibility checks.
+5. Practice-local date, active practice-member linkage, and inclusive coverage are evaluated.
+6. The authorization, procedure lines, and `authorization.submitted` audit event commit together.
+7. Accepted and rejected attempt diagnostics commit through an independent session so main-transaction rollbacks remain diagnosable.
+
+The independent diagnostic write is best-effort and retains no raw PHI. It never replaces the primary client response if diagnostic persistence fails.
+
+### 5.5 Reviewer Workflow and State Machine
+
+![Reviewer workflow and state machine](diagrams/export/oxh-pa-technical-05-reviewer-workflow.svg)
+
+The only implemented lifecycle is:
+
+```text
+submitted → in_review → decided
+```
+
+- Queue retrieval is FIFO and excludes members the reviewer treats; unclaimed queue records withhold clinical notes.
+- Claiming uses a conditional update requiring `submitted` and unassigned state. One concurrent reviewer wins; the other receives `409`.
+- Admin reassignment changes the active reviewer only while `in_review`; status remains unchanged and the prior reviewer immediately loses access.
+- Final decision uses `SELECT ... FOR UPDATE`, rechecks assignment and treating conflict, and requires an exact one-to-one decision set for all procedures.
+- Parent decision attribution, procedure decisions, final state, and `authorization.decided` audit event commit atomically.
+
+No reopen, partial decision, return-to-queue, appeal, or retro-review transition is implemented.
+
+### 5.6 Role and Data Visibility
+
+![Role and data visibility matrix](diagrams/export/oxh-pa-technical-06-role-visibility.svg)
+
+Visibility is enforced by response-model construction and record-level checks rather than delegated to a UI:
+
+- Office responses are practice-scoped and omit internal denial reasoning.
+- Member responses are own-member only and omit clinical notes and denial reasoning.
+- Reviewer queue projections include procedure metadata but mask the clinical note until claim.
+- Assigned reviewers receive clinical detail and internal decision reasoning only for their current assignments.
+- Admin responses are cross-tenant and expose full operational fields; audit and submission diagnostics remain separate admin endpoints.
+
+Cross-practice, other-member, unassigned-reviewer, and conflict-sensitive lookups return `404` where confirming existence would itself disclose protected information.
+
+### 5.7 Request Diagnostics and Error Flow
+
+![Request diagnostics and error flow](diagrams/export/oxh-pa-technical-07-diagnostics-error-flow.svg)
+
+Every response receives a new server-generated UUID `X-Request-ID`. An optional `X-Correlation-ID` is trimmed, echoed, included in Problem Details, and made searchable; an incoming `X-Request-ID` is only a fallback correlation value and is never trusted as the server uniqueness key.
+
+Logs contain method, path, status, duration, request ID, and correlation ID only—never authorization headers, bodies, clinical notes, or PHI. Failures return `application/problem+json` with stable top-level and field-level codes.
+
+Submission diagnostics record accepted creates/replays and rejected schema, idempotency, or business outcomes through a separate session. Admin support routes can search by request or correlation ID without exposing the submitted clinical payload. `/health/live` remains process-only, while `/health/ready` executes `SELECT 1` and returns `503` when PostgreSQL is unavailable.
 
 ---
 
@@ -127,6 +232,8 @@ Every error response returns `Content-Type: application/problem+json` conforming
 - `sql/`: Database bootstrap script (`create_databases.sql`) creating `oxh_prior_auth` and `oxh_prior_auth_test`.
 - `postman/`: Single-file Postman v2.1 / Bruno collection (`Oxbridge-PA.postman_collection.json`).
 - `tests/`: Pytest suite (`conftest.py`, `test_api.py`) running all 11 behavioral tests against real PostgreSQL.
+- `diagrams/source/`: Editable seven-page Draw.io source (`oxh-pa-technical-architecture.drawio`) grounded in `TECHNICAL_ARCHITECTURE.md`.
+- `diagrams/export/`: Seven SVG views covering context, components, ERD, submission, reviewer state, role visibility, and diagnostics.
 
 ---
 
