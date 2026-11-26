@@ -1,0 +1,26 @@
+# Byte-compiled / virtual environments / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.ENV/
+*.bak
+*.swp
+*.swo
+*~
+
+# Test, linter, typechecker, coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local secrets & runtime artifacts
+.env
+*.log

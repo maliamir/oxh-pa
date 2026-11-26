@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-oxh_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oxh_password}
+      POSTGRES_DB: ${POSTGRES_DB:-oxh_prior_auth}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/create_databases.sql:/docker-entrypoint-initdb.d/01_create_databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-oxh_user} -d ${POSTGRES_DB:-oxh_prior_auth}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_HOST: ${APP_HOST:-0.0.0.0}
+      APP_PORT: ${APP_PORT:-8000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SEED_ON_STARTUP: ${SEED_ON_STARTUP:-true}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://oxh_user:oxh_password@postgres:5432/oxh_prior_auth}
+      TEST_DATABASE_URL: ${TEST_DATABASE_URL:-postgresql+psycopg://oxh_user:oxh_password@postgres:5432/oxh_prior_auth_test}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-oxh-local-dev-secret-change-in-production-32chars-min}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_ISSUER: ${JWT_ISSUER:-oxh-identity}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-oxh-pa}
+      JWT_ACCESS_TOKEN_EXPIRE_HOURS: ${JWT_ACCESS_TOKEN_EXPIRE_HOURS:-720}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+volumes:
+  pgdata:

@@ -1,0 +1,240 @@
+{
+  "info": {
+    "_postman_id": "8e19b370-1111-4000-8000-000000000001",
+    "name": "Oxbridge Health Prior Authorization API",
+    "description": "Self-contained Postman Collection v2.1 (importable into Postman and Bruno) exercising health checks, submission, queue, claim, decision, member-safe view, audit trail, invalid submission, and support diagnostics.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000", "type": "string" },
+    { "key": "office_token", "value": "<run: docker compose exec api python -m app.tokens>", "type": "string" },
+    { "key": "member_token", "value": "<run: docker compose exec api python -m app.tokens>", "type": "string" },
+    { "key": "reviewer_token", "value": "<run: docker compose exec api python -m app.tokens>", "type": "string" },
+    { "key": "admin_token", "value": "<run: docker compose exec api python -m app.tokens>", "type": "string" },
+    { "key": "member_id", "value": "20000000-0000-0000-0000-000000000001", "type": "string" },
+    { "key": "unlinked_member_id", "value": "20000000-0000-0000-0000-000000000002", "type": "string" },
+    { "key": "service_date", "value": "", "type": "string" },
+    { "key": "authorization_id", "value": "", "type": "string" },
+    { "key": "procedure_id_1", "value": "", "type": "string" },
+    { "key": "procedure_id_2", "value": "", "type": "string" },
+    { "key": "support_correlation_id", "value": "bruno-invalid-submit-req-001", "type": "string" },
+    { "key": "support_request_id", "value": "", "type": "string" }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "if (!pm.collectionVariables.get('service_date')) {",
+          "  const d = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);",
+          "  pm.collectionVariables.set('service_date', d.toISOString().slice(0, 10));",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "01. Health Readiness",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health/ready",
+          "host": ["{{base_url}}"],
+          "path": ["health", "ready"]
+        }
+      }
+    },
+    {
+      "name": "02. Submit Prior Authorization (Office)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "try {",
+              "  const data = pm.response.json();",
+              "  if (data && data.id) {",
+              "    pm.collectionVariables.set('authorization_id', data.id);",
+              "  }",
+              "  if (data && Array.isArray(data.procedures)) {",
+              "    if (data.procedures[0] && data.procedures[0].id) {",
+              "      pm.collectionVariables.set('procedure_id_1', data.procedures[0].id);",
+              "    }",
+              "    if (data.procedures[1] && data.procedures[1].id) {",
+              "      pm.collectionVariables.set('procedure_id_2', data.procedures[1].id);",
+              "    }",
+              "  }",
+              "} catch (err) {",
+              "  console.warn('Could not parse PA submission response JSON:', err.message);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{office_token}}" },
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "demo-pa-collection-001" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"member_id\": \"{{member_id}}\",\n  \"diagnosis_code\": \"M54.5\",\n  \"service_date\": \"{{service_date}}\",\n  \"clinical_note\": \"Lumbar MRI and brace requested after 6 weeks conservative therapy.\",\n  \"procedures\": [\n    { \"code_system\": \"CPT\", \"code\": \"72148\", \"units\": 1 },\n    { \"code_system\": \"HCPCS\", \"code\": \"E0747\", \"units\": 1 }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/v1/office/prior-authorizations",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "office", "prior-authorizations"]
+        }
+      }
+    },
+    {
+      "name": "03. List Reviewer Queue",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{reviewer_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/v1/reviewer/queue",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "reviewer", "queue"]
+        }
+      }
+    },
+    {
+      "name": "04. Claim Authorization (Reviewer)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{reviewer_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/v1/reviewer/prior-authorizations/{{authorization_id}}/claim",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "reviewer", "prior-authorizations", "{{authorization_id}}", "claim"]
+        }
+      }
+    },
+    {
+      "name": "05. Decide Authorization (Reviewer)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{reviewer_token}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"decisions\": [\n    {\n      \"procedure_id\": \"{{procedure_id_1}}\",\n      \"outcome\": \"approved\"\n    },\n    {\n      \"procedure_id\": \"{{procedure_id_2}}\",\n      \"outcome\": \"denied\",\n      \"denial_reason\": \"DME medical necessity criteria not met on submitted documentation.\"\n    }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/v1/reviewer/prior-authorizations/{{authorization_id}}/decision",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "reviewer", "prior-authorizations", "{{authorization_id}}", "decision"]
+        }
+      }
+    },
+    {
+      "name": "06. Member Safe Read (No Note or Denial Reason)",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{member_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/v1/member/prior-authorizations/{{authorization_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "member", "prior-authorizations", "{{authorization_id}}"]
+        }
+      }
+    },
+    {
+      "name": "07. Read Audit Events (Admin)",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/v1/admin/prior-authorizations/{{authorization_id}}/audit-events",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "admin", "prior-authorizations", "{{authorization_id}}", "audit-events"]
+        }
+      }
+    },
+    {
+      "name": "08. Invalid Submission (Unlinked Member)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "try {",
+              "  const data = pm.response.json();",
+              "  if (data && data.request_id) {",
+              "    pm.collectionVariables.set('support_request_id', data.request_id);",
+              "  }",
+              "} catch (err) {",
+              "  console.warn('Could not parse invalid submission response JSON:', err.message);",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{office_token}}" },
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Idempotency-Key", "value": "demo-pa-invalid-001" },
+          { "key": "X-Correlation-ID", "value": "{{support_correlation_id}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"member_id\": \"{{unlinked_member_id}}\",\n  \"diagnosis_code\": \"M54.5\",\n  \"service_date\": \"{{service_date}}\",\n  \"procedures\": [\n    { \"code_system\": \"CPT\", \"code\": \"99213\", \"units\": 1 }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{base_url}}/v1/office/prior-authorizations",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "office", "prior-authorizations"]
+        }
+      }
+    },
+    {
+      "name": "09. Admin Support Lookup by Request ID",
+      "request": {
+        "method": "GET",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{admin_token}}" }
+        ],
+        "url": {
+          "raw": "{{base_url}}/v1/admin/submission-attempts/{{support_request_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["v1", "admin", "submission-attempts", "{{support_request_id}}"]
+        }
+      }
+    }
+  ]
+}
